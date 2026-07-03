@@ -1,0 +1,21 @@
+{
+  "name": "talentlms-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Lightweight Express proxy that exposes TalentLMS course/category data to the Elevate Skills frontend without leaking the API key.",
+  "main": "server.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.9",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "nodemailer": "^9.0.0"
+  }
+}
