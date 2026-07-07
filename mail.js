@@ -402,6 +402,132 @@ function buildContactEmail(payload) {
   };
 }
 
+function buildPurchaseLearnerEmail(order) {
+  const portalUrl = (process.env.PUBLIC_LMS_URL || '').trim();
+  const isNewUser = order.enrolment.user_created;
+  const enrolled = order.enrolment.status === 'success';
+  const amountLine = `${order.course.currency} ${Number(order.course.amount).toFixed(2)}`;
+
+  const textLines = [
+    `Hi ${order.buyer.first_name},`,
+    '',
+    enrolled
+      ? `Thank you for your purchase! You are now enrolled in "${order.course.name}".`
+      : `Thank you for your payment for "${order.course.name}". Your enrolment is being finalised and we will confirm shortly.`,
+    '',
+    `Order number: ${order.order_number}`,
+    `Amount paid: ${amountLine}`,
+    ''
+  ];
+
+  if (enrolled) {
+    textLines.push('Access your course here:', portalUrl || 'Learner portal link to follow', '');
+    if (isNewUser && order.enrolment.lms_login) {
+      textLines.push(
+        'A learner account was created for you:',
+        `Username: ${order.enrolment.lms_login}`,
+        `Temporary password: ${order.enrolment.lms_temp_password}`,
+        'Please change your password after your first login.',
+        ''
+      );
+    }
+  }
+
+  textLines.push('Need help? Reply to this email or contact help@elevateskills.online.', '', 'Elevate Skills — Empowering Skills. Elevating Potential.');
+
+  const credentialsHtml =
+    enrolled && isNewUser && order.enrolment.lms_login
+      ? `<div style="margin:16px 0;padding:14px 16px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;">
+           <p style="margin:0 0 6px;font-size:13px;color:#475569;font-weight:700;">Your learner account</p>
+           <p style="margin:0;font-size:14px;color:#0f172a;">Username: <strong>${escapeHtml(order.enrolment.lms_login)}</strong></p>
+           <p style="margin:4px 0 0;font-size:14px;color:#0f172a;">Temporary password: <strong>${escapeHtml(order.enrolment.lms_temp_password || '')}</strong></p>
+           <p style="margin:8px 0 0;font-size:12px;color:#64748b;">Please change your password after your first login.</p>
+         </div>`
+      : '';
+
+  const html = `<!DOCTYPE html>
+<html lang="en">
+<body style="margin:0;padding:24px;background:#f1f5f9;font-family:Inter,Segoe UI,Arial,sans-serif;">
+  <div style="max-width:600px;margin:0 auto;background:#ffffff;border:1px solid #e2e8f0;border-radius:12px;overflow:hidden;">
+    <div style="background:linear-gradient(135deg,#1e3a8a 0%,#1d4ed8 100%);padding:28px 32px;">
+      <p style="margin:0 0 6px;font-size:12px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;color:#bfdbfe;">Elevate Skills</p>
+      <h1 style="margin:0;font-size:22px;color:#ffffff;">${enrolled ? 'You are enrolled!' : 'Payment received'}</h1>
+    </div>
+    <div style="padding:24px 32px;">
+      <p style="font-size:14px;color:#0f172a;">Hi ${escapeHtml(order.buyer.first_name)},</p>
+      <p style="font-size:14px;color:#0f172a;line-height:1.6;">
+        ${
+          enrolled
+            ? `Thank you for your purchase! You are now enrolled in <strong>${escapeHtml(order.course.name)}</strong>.`
+            : `Thank you for your payment for <strong>${escapeHtml(order.course.name)}</strong>. Your enrolment is being finalised and we will confirm shortly.`
+        }
+      </p>
+      <table style="width:100%;border-collapse:collapse;margin:16px 0;font-size:14px;">
+        <tr><td style="padding:8px 0;color:#64748b;">Order number</td><td style="padding:8px 0;color:#0f172a;font-weight:600;text-align:right;">${escapeHtml(order.order_number)}</td></tr>
+        <tr><td style="padding:8px 0;color:#64748b;border-top:1px solid #e2e8f0;">Amount paid</td><td style="padding:8px 0;color:#0f172a;font-weight:600;text-align:right;border-top:1px solid #e2e8f0;">${escapeHtml(amountLine)}</td></tr>
+      </table>
+      ${credentialsHtml}
+      ${
+        enrolled && portalUrl
+          ? `<p style="text-align:center;margin:20px 0;"><a href="${portalUrl}" style="display:inline-block;background:#1d4ed8;color:#ffffff;text-decoration:none;font-weight:600;padding:12px 24px;border-radius:8px;font-size:14px;">Go to your course</a></p>`
+          : ''
+      }
+      <p style="font-size:12px;color:#64748b;">Need help? Reply to this email or contact help@elevateskills.online.</p>
+    </div>
+    <div style="padding:16px 32px;background:#f8fafc;border-top:1px solid #e2e8f0;text-align:center;">
+      <p style="margin:0;font-size:12px;color:#64748b;"><strong style="color:#1e3a8a;">Elevate Skills</strong> · Empowering Skills. Elevating Potential.</p>
+    </div>
+  </div>
+</body>
+</html>`;
+
+  return {
+    subject: `[Elevate Skills] ${enrolled ? 'Enrolment confirmed' : 'Payment received'} — ${order.course.name} (${order.order_number})`,
+    text: textLines.join('\n'),
+    html
+  };
+}
+
+function buildPurchaseAdminEmail(order) {
+  const enrolled = order.enrolment.status === 'success';
+  const lines = [
+    `${enrolled ? 'New purchase completed' : 'PURCHASE NEEDS ATTENTION — enrolment failed'} - Elevate Skills`,
+    '',
+    `Order: ${order.order_number}`,
+    `Status: ${order.status}`,
+    `Course: ${order.course.name} (id ${order.course.id})`,
+    `Amount: ${order.course.currency} ${Number(order.course.amount).toFixed(2)}`,
+    `Provider: ${order.provider} (${order.provider_ref || '—'})`,
+    '',
+    `Buyer: ${order.buyer.first_name} ${order.buyer.last_name}`,
+    `Email: ${order.buyer.email}`,
+    `Phone: ${displayValue(order.buyer.phone)}`,
+    '',
+    `Enrolment: ${order.enrolment.status}`,
+    `TalentLMS user: ${displayValue(order.enrolment.talentlms_user_id)} ${order.enrolment.user_created ? '(newly created)' : ''}`,
+    order.enrolment.last_error ? `Error: ${order.enrolment.last_error}` : '',
+    '',
+    `Paid at: ${displayValue(order.payment.paid_at)}`
+  ].filter((l) => l !== '');
+
+  return {
+    subject: `[Elevate Skills] ${enrolled ? 'Purchase' : 'ACTION REQUIRED: enrolment failed'} — ${order.order_number}`,
+    text: lines.join('\n'),
+    html: `<pre style="font-family:monospace;font-size:13px;">${escapeHtml(lines.join('\n'))}</pre>`
+  };
+}
+
+/** Sends learner confirmation + admin notification after a paid order. */
+async function sendPurchaseEmails(order) {
+  const learnerMail = buildPurchaseLearnerEmail(order);
+  const adminMail = buildPurchaseAdminEmail(order);
+  const [learner, admin] = await Promise.all([
+    deliverMail('purchase-learner', order.buyer.email, CONTACT_EMAIL_TO, learnerMail),
+    deliverMail('purchase-admin', CONTACT_EMAIL_TO, order.buyer.email, adminMail)
+  ]);
+  return { learner, admin };
+}
+
 async function sendInterestEmail(payload) {
   const mail = buildInterestEmail(payload);
   return deliverMail('register-interest', INTEREST_EMAIL_TO, payload.email, mail);
@@ -415,6 +541,7 @@ async function sendContactEmail(payload) {
 module.exports = {
   sendInterestEmail,
   sendContactEmail,
+  sendPurchaseEmails,
   INTEREST_EMAIL_TO,
   CONTACT_EMAIL_TO
 };

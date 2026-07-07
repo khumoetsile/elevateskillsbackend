@@ -6,6 +6,7 @@ const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const { sendInterestEmail, sendContactEmail } = require('./mail');
+const checkoutRoutes = require('./checkout');
 
 const PORT = parseInt(process.env.PORT, 10) || 4000;
 const BASE_PATH = (process.env.BASE_PATH || '').replace(/\/$/, '');
@@ -79,16 +80,33 @@ function buildLmsConfig() {
   };
 }
 
+function decodeEntities(value) {
+  return String(value || '')
+    .replace(/&#(\d+);/g, (_, code) => String.fromCharCode(Number(code)))
+    .replace(/&amp;/g, '&')
+    .replace(/&nbsp;/g, ' ');
+}
+
+function mapUnits(raw) {
+  if (!Array.isArray(raw.units)) return [];
+  return raw.units.map((u) => ({
+    id: String(u.id ?? ''),
+    name: u.name ?? '',
+    type: u.type ?? ''
+  }));
+}
+
 function mapCourse(raw, categoryMap) {
   const id = String(raw.id ?? '');
   const categoryId = raw.category_id ? String(raw.category_id) : '';
   const categorySlug = categoryMap.get(categoryId) ?? 'general';
+  const description = raw.description == null ? '' : String(raw.description);
   return {
     id,
     name: raw.name ?? '',
     code: raw.code ?? '',
-    description: raw.description ?? '',
-    price: raw.price ?? '',
+    description,
+    price: decodeEntities(raw.price ?? ''),
     status: raw.status ?? '',
     level: raw.level ?? '',
     image: raw.big_avatar || raw.avatar || '',
@@ -99,8 +117,12 @@ function mapCourse(raw, categoryMap) {
     hide_from_catalog: raw.hide_from_catalog === '1' || raw.hide_from_catalog === 1,
     certification: raw.certification ?? '',
     certification_duration: raw.certification_duration ?? '',
+    time_limit: raw.time_limit ?? '',
     creation_date: raw.creation_date ?? '',
-    lms_url: buildCourseLmsUrl(id, raw.shared_url)
+    lms_url: buildCourseLmsUrl(id, raw.shared_url),
+    units: mapUnits(raw),
+    rules: Array.isArray(raw.rules) ? raw.rules.filter(Boolean) : [],
+    prerequisites: Array.isArray(raw.prerequisites) ? raw.prerequisites.filter(Boolean) : []
   };
 }
 
@@ -320,6 +342,8 @@ routes.post('/api/contact', async (req, res) => {
     });
   }
 });
+
+routes.use(checkoutRoutes);
 
 // Mount at BASE_PATH for cPanel subfolder URLs (e.g. /backend) and at / for local dev.
 if (BASE_PATH) {
