@@ -37,10 +37,19 @@ const lms = axios.create({
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 function decodeEntities(value) {
-  return String(value || '')
-    .replace(/&#(\d+);/g, (_, code) => String.fromCharCode(Number(code)))
-    .replace(/&amp;/g, '&')
-    .replace(/&nbsp;/g, ' ');
+  let out = String(value || '');
+  // Twice so double-encoded values like `&amp;#36;` become `$`.
+  for (let i = 0; i < 2; i++) {
+    out = out
+      .replace(/&amp;/g, '&')
+      .replace(/&#(\d+);/g, (_, code) => String.fromCharCode(Number(code)))
+      .replace(/&#x([0-9a-f]+);/gi, (_, hex) =>
+        String.fromCharCode(parseInt(hex, 16))
+      )
+      .replace(/&dollar;/gi, '$')
+      .replace(/&nbsp;/g, ' ');
+  }
+  return out;
 }
 
 function parseAmount(rawPrice) {
@@ -188,8 +197,15 @@ router.post('/api/checkout/create', async (req, res) => {
       provider: provider.name
     });
   } catch (err) {
-    console.error('[checkout] order creation failed:', err.message);
-    return res.status(503).json({ ok: false, message: 'Checkout is temporarily unavailable.' });
+    console.error('[checkout] order creation failed:', err.code || '', err.message);
+    return res.status(503).json({
+      ok: false,
+      message: 'Checkout is temporarily unavailable.',
+      detail:
+        process.env.NODE_ENV === 'production'
+          ? 'Database connection failed. Check DB_* env vars and cPanel MySQL setup.'
+          : err.message
+    });
   }
 
   const { provider_ref, payment_url } = provider.createPayment(order);

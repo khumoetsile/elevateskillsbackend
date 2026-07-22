@@ -46,6 +46,16 @@ async function init() {
   if (pool) return pool;
   if (!initPromise) {
     initPromise = (async () => {
+      if (!DB_USER || !DB_NAME) {
+        throw new Error(
+          'MySQL is not configured. Set DB_HOST, DB_USER, DB_PASSWORD, and DB_NAME in .env (create the database in cPanel → MySQL Databases first).'
+        );
+      }
+
+      console.log(
+        `[store] connecting to MySQL ${DB_HOST}:${DB_PORT} as ${DB_USER} / ${DB_NAME}`
+      );
+
       // Best effort: create the database when running locally as root.
       // On cPanel this typically fails (no CREATE privilege) — the database
       // is created in the cPanel UI instead, so the error is ignored.
@@ -75,8 +85,18 @@ async function init() {
         namedPlaceholders: true
       });
 
-      await pool.query(SCHEMA);
-      console.log(`[store] MySQL ready (${DB_HOST}/${DB_NAME})`);
+      try {
+        await pool.query(SCHEMA);
+      } catch (err) {
+        console.error(
+          `[store] failed to create/open tables on ${DB_HOST}/${DB_NAME}:`,
+          err.code || '',
+          err.message
+        );
+        throw err;
+      }
+
+      console.log(`[store] MySQL ready (${DB_HOST}/${DB_NAME}) — orders table OK`);
       return pool;
     })().catch((err) => {
       initPromise = null;
@@ -85,6 +105,23 @@ async function init() {
     });
   }
   return initPromise;
+}
+
+/** Lightweight readiness check for /health. */
+async function ping() {
+  try {
+    await init();
+    await pool.query('SELECT 1');
+    return { ok: true, host: DB_HOST, database: DB_NAME };
+  } catch (err) {
+    return {
+      ok: false,
+      host: DB_HOST,
+      database: DB_NAME,
+      user: DB_USER,
+      error: err.message
+    };
+  }
 }
 
 function rowToOrder(row) {
@@ -193,4 +230,4 @@ async function listOrders() {
   return rows.map(rowToOrder);
 }
 
-module.exports = { init, createOrder, getOrder, updateOrder, addEvent, listOrders };
+module.exports = { init, ping, createOrder, getOrder, updateOrder, addEvent, listOrders };

@@ -81,10 +81,19 @@ function buildLmsConfig() {
 }
 
 function decodeEntities(value) {
-  return String(value || '')
-    .replace(/&#(\d+);/g, (_, code) => String.fromCharCode(Number(code)))
-    .replace(/&amp;/g, '&')
-    .replace(/&nbsp;/g, ' ');
+  let out = String(value || '');
+  // Twice so double-encoded values like `&amp;#36;` become `$`.
+  for (let i = 0; i < 2; i++) {
+    out = out
+      .replace(/&amp;/g, '&')
+      .replace(/&#(\d+);/g, (_, code) => String.fromCharCode(Number(code)))
+      .replace(/&#x([0-9a-f]+);/gi, (_, hex) =>
+        String.fromCharCode(parseInt(hex, 16))
+      )
+      .replace(/&dollar;/gi, '$')
+      .replace(/&nbsp;/g, ' ');
+  }
+  return out;
 }
 
 function mapUnits(raw) {
@@ -162,13 +171,16 @@ routes.get('/', (_req, res) => {
   res.type('text/plain').send(`Elevate Skills API\nNode ${process.version}\nHealth: ${BASE_PATH || ''}/health`);
 });
 
-routes.get('/health', (_req, res) => {
-  res.json({
-    ok: true,
+routes.get('/health', async (_req, res) => {
+  const store = require('./store');
+  const db = await store.ping();
+  res.status(db.ok ? 200 : 503).json({
+    ok: db.ok,
     base_path: BASE_PATH || '/',
     domain_configured: Boolean(TALENTLMS_DOMAIN),
     api_key_configured: Boolean(TALENTLMS_API_KEY),
-    public_lms_url: PUBLIC_LMS_URL || null
+    public_lms_url: PUBLIC_LMS_URL || null,
+    database: db
   });
 });
 
