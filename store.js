@@ -12,6 +12,7 @@
 
 const mysql = require('mysql2/promise');
 const crypto = require('crypto');
+const { blindIndex, protect, unprotect } = require('./security');
 
 const DB_HOST = (process.env.DB_HOST || 'localhost').trim();
 const DB_PORT = parseInt(process.env.DB_PORT, 10) || 3306;
@@ -22,7 +23,7 @@ const DB_NAME = (process.env.DB_NAME || 'elevatekills').trim();
 let pool = null;
 let initPromise = null;
 
-const SCHEMA = `
+const ORDERS_SCHEMA = `
 CREATE TABLE IF NOT EXISTS orders (
   seq INT AUTO_INCREMENT PRIMARY KEY,
   id CHAR(36) NOT NULL UNIQUE,
@@ -39,6 +40,29 @@ CREATE TABLE IF NOT EXISTS orders (
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   INDEX idx_orders_status (status),
   INDEX idx_orders_buyer_email (buyer_email)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+`;
+
+const ENQUIRIES_SCHEMA = `
+CREATE TABLE IF NOT EXISTS enquiries (
+  seq INT AUTO_INCREMENT PRIMARY KEY,
+  id CHAR(36) NOT NULL UNIQUE,
+  type VARCHAR(32) NOT NULL,
+  name VARCHAR(255) NOT NULL,
+  email VARCHAR(255) NOT NULL,
+  phone VARCHAR(64) NULL,
+  company VARCHAR(255) NULL,
+  subject VARCHAR(255) NULL,
+  message TEXT NOT NULL,
+  consent TINYINT(1) NOT NULL DEFAULT 0,
+  status VARCHAR(32) NOT NULL DEFAULT 'new',
+  data JSON NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  INDEX idx_enquiries_type (type),
+  INDEX idx_enquiries_status (status),
+  INDEX idx_enquiries_email (email),
+  INDEX idx_enquiries_created (created_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 `;
 
@@ -86,7 +110,8 @@ async function init() {
       });
 
       try {
-        await pool.query(SCHEMA);
+        await pool.query(ORDERS_SCHEMA);
+        await pool.query(ENQUIRIES_SCHEMA);
       } catch (err) {
         console.error(
           `[store] failed to create/open tables on ${DB_HOST}/${DB_NAME}:`,
@@ -96,7 +121,7 @@ async function init() {
         throw err;
       }
 
-      console.log(`[store] MySQL ready (${DB_HOST}/${DB_NAME}) — orders table OK`);
+      console.log(`[store] MySQL ready (${DB_HOST}/${DB_NAME}) — orders & enquiries tables OK`);
       return pool;
     })().catch((err) => {
       initPromise = null;
@@ -124,9 +149,34 @@ async function ping() {
   }
 }
 
+function transformSensitiveOrderFields(order, transform) {
+  const copy = JSON.parse(JSON.stringify(order));
+  const id = String(copy.id || 'unknown');
+  const apply = (target, field, label) => {
+    if (target && target[field] != null && target[field] !== '') {
+      target[field] = transform(target[field], `order:${id}:${label}`);
+    }
+  };
+
+  apply(copy, 'access_token', 'access-token');
+  apply(copy, 'provider_ref', 'provider-reference');
+  apply(copy.buyer, 'first_name', 'buyer-first-name');
+  apply(copy.buyer, 'last_name', 'buyer-last-name');
+  apply(copy.buyer, 'email', 'buyer-email');
+  apply(copy.buyer, 'phone', 'buyer-phone');
+  apply(copy.payment, 'approval', 'payment-approval');
+  apply(copy.enrolment, 'lms_login', 'lms-login');
+  apply(copy.enrolment, 'lms_temp_password', 'lms-temporary-password');
+  return copy;
+}
+
+function orderForStorage(order) {
+  return transformSensitiveOrderFields(order, protect);
+}
+
 function rowToOrder(row) {
-  const order = typeof row.data === 'string' ? JSON.parse(row.data) : row.data;
-  return order;
+  const stored = typeof row.data === 'string' ? JSON.parse(row.data) : row.data;
+  return transformSensitiveOrderFields(stored, unprotect);
 }
 
 async function createOrder({ buyer, course, provider }) {
@@ -163,19 +213,19 @@ async function createOrder({ buyer, course, provider }) {
     [
       order.id,
       order.status,
-      buyer.email,
+      blindIndex(buyer.email, 'order-buyer-email'),
       course.id,
       provider,
       course.amount,
       course.currency,
-      JSON.stringify(order)
+      JSON.stringify(orderForStorage(order))
     ]
   );
 
   order.order_number = `ES-${new Date().getFullYear()}-${String(result.insertId).padStart(6, '0')}`;
   await pool.execute(
     `UPDATE orders SET order_number = ?, data = ? WHERE id = ?`,
-    [order.order_number, JSON.stringify(order), order.id]
+    [order.order_number, JSON.stringify(orderForStorage(order)), order.id]
   );
 
   return order;
@@ -208,7 +258,12 @@ async function updateOrder(id, mutate) {
       `UPDATE orders
          SET status = ?, provider_ref = ?, data = ?
        WHERE id = ?`,
-      [order.status, order.provider_ref, JSON.stringify(order), id]
+      [
+        order.status,
+        blindIndex(order.provider_ref, 'order-provider-reference'),
+        JSON.stringify(orderForStorage(order)),
+        id
+      ]
     );
     await conn.commit();
     return order;
@@ -230,4 +285,109 @@ async function listOrders() {
   return rows.map(rowToOrder);
 }
 
-module.exports = { init, ping, createOrder, getOrder, updateOrder, addEvent, listOrders };
+function rowToEnquiry(row) {
+  const extra = row.data
+    ? typeof row.data === 'string'
+      ? JSON.parse(row.data)
+      : row.data
+    : {};
+  return {
+    id: row.id,
+    type: row.type,
+    name: row.name,
+    email: row.email,
+    phone: row.phone || null,
+    company: row.company || null,
+    subject: row.subject || null,
+    message: row.message,
+    consent: Boolean(row.consent),
+    status: row.status,
+    data: extra,
+    created_at:
+      row.created_at instanceof Date ? row.created_at.toISOString() : String(row.created_at),
+    updated_at:
+      row.updated_at instanceof Date ? row.updated_at.toISOString() : String(row.updated_at)
+  };
+}
+
+async function createEnquiry({
+  type,
+  name,
+  email,
+  phone,
+  company,
+  subject,
+  message,
+  consent,
+  data
+}) {
+  await init();
+  const id = crypto.randomUUID();
+  const payload = data && typeof data === 'object' ? data : {};
+  await pool.execute(
+    `INSERT INTO enquiries (id, type, name, email, phone, company, subject, message, consent, status, data)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', ?)`,
+    [
+      id,
+      String(type || 'general').trim(),
+      String(name || '').trim(),
+      String(email || '').trim().toLowerCase(),
+      phone ? String(phone).trim() : null,
+      company ? String(company).trim() : null,
+      subject ? String(subject).trim() : null,
+      String(message || '').trim(),
+      consent ? 1 : 0,
+      JSON.stringify(payload)
+    ]
+  );
+  return getEnquiry(id);
+}
+
+async function getEnquiry(id) {
+  await init();
+  const [rows] = await pool.execute(`SELECT * FROM enquiries WHERE id = ?`, [id]);
+  return rows.length ? rowToEnquiry(rows[0]) : null;
+}
+
+async function listEnquiries({ type, status, limit } = {}) {
+  await init();
+  const max = Math.min(Math.max(parseInt(limit, 10) || 200, 1), 500);
+  const clauses = [];
+  const params = [];
+  if (type) {
+    clauses.push('type = ?');
+    params.push(String(type).trim());
+  }
+  if (status) {
+    clauses.push('status = ?');
+    params.push(String(status).trim());
+  }
+  const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+  const [rows] = await pool.query(
+    `SELECT * FROM enquiries ${where} ORDER BY seq DESC LIMIT ${max}`,
+    params
+  );
+  return rows.map(rowToEnquiry);
+}
+
+async function updateEnquiryStatus(id, status) {
+  await init();
+  const next = String(status || '').trim();
+  if (!next) return null;
+  await pool.execute(`UPDATE enquiries SET status = ? WHERE id = ?`, [next, id]);
+  return getEnquiry(id);
+}
+
+module.exports = {
+  init,
+  ping,
+  createOrder,
+  getOrder,
+  updateOrder,
+  addEvent,
+  listOrders,
+  createEnquiry,
+  getEnquiry,
+  listEnquiries,
+  updateEnquiryStatus
+};

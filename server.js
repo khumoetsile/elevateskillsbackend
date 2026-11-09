@@ -5,13 +5,18 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
+const visibility = require('./course-visibility');
 const { sendInterestEmail, sendContactEmail } = require('./mail');
 const checkoutRoutes = require('./checkout');
+const authRoutes = require('./auth');
+const store = require('./store');
+const { isEncryptionConfigured } = require('./security');
 
 const PORT = parseInt(process.env.PORT, 10) || 4000;
 const BASE_PATH = (process.env.BASE_PATH || '').replace(/\/$/, '');
 const TALENTLMS_DOMAIN = (process.env.TALENTLMS_DOMAIN || '').trim();
 const TALENTLMS_API_KEY = (process.env.TALENTLMS_API_KEY || '').trim();
+const ADMIN_API_KEY = (process.env.ADMIN_API_KEY || '').trim();
 const PUBLIC_LMS_URL =
   (process.env.PUBLIC_LMS_URL || '').trim() ||
   (TALENTLMS_DOMAIN ? `https://${TALENTLMS_DOMAIN}` : '');
@@ -29,11 +34,43 @@ if (!TALENTLMS_DOMAIN || !TALENTLMS_API_KEY) {
 
 const app = express();
 app.disable('x-powered-by');
-app.use(express.json());
+if (process.env.TRUST_PROXY) {
+  const trustProxy = String(process.env.TRUST_PROXY).trim();
+  app.set(
+    'trust proxy',
+    /^\d+$/.test(trustProxy)
+      ? parseInt(trustProxy, 10)
+      : trustProxy === 'true'
+        ? 1
+        : trustProxy
+  );
+}
+app.use((req, res, next) => {
+  res.set('X-Content-Type-Options', 'nosniff');
+  res.set('X-Frame-Options', 'DENY');
+  res.set('Referrer-Policy', 'no-referrer');
+  res.set('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+  if (process.env.NODE_ENV === 'production') {
+    res.set('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  }
+  next();
+});
+app.use(express.json({ limit: '64kb', strict: true }));
 app.use(
   cors({
-    origin: ALLOWED_ORIGINS.length === 0 ? true : ALLOWED_ORIGINS,
-    credentials: false
+    // Reflect request origin when allow-list is empty (local dev).
+    // Credentials require an explicit origin (not `*`).
+    origin:
+      ALLOWED_ORIGINS.length === 0
+        ? true
+        : (origin, callback) => {
+            if (!origin || ALLOWED_ORIGINS.includes(origin)) {
+              callback(null, true);
+            } else {
+              callback(null, false);
+            }
+          },
+    credentials: true
   })
 );
 
@@ -152,6 +189,9 @@ function buildCategoryMap(categories) {
 }
 
 function handleLmsError(res, err, fallback) {
+  if (err.code === 'course_visibility_unavailable') {
+    return res.status(503).json({ error: err.code, message: err.message });
+  }
   const status = err?.response?.status ?? 502;
   const body = err?.response?.data;
   console.error('[talentlms-proxy] LMS error', status, body || err.message);
@@ -167,12 +207,17 @@ function handleLmsError(res, err, fallback) {
 
 const routes = express.Router();
 
+// Public catalogs must be revalidated against the server's visibility TTL.
+routes.use('/api/talentlms', (_req, res, next) => {
+  res.set('Cache-Control', 'no-store');
+  next();
+});
+
 routes.get('/', (_req, res) => {
   res.type('text/plain').send(`Elevate Skills API\nNode ${process.version}\nHealth: ${BASE_PATH || ''}/health`);
 });
 
 routes.get('/health', async (_req, res) => {
-  const store = require('./store');
   const db = await store.ping();
   res.status(db.ok ? 200 : 503).json({
     ok: db.ok,
@@ -180,9 +225,24 @@ routes.get('/health', async (_req, res) => {
     domain_configured: Boolean(TALENTLMS_DOMAIN),
     api_key_configured: Boolean(TALENTLMS_API_KEY),
     public_lms_url: PUBLIC_LMS_URL || null,
+    payment_provider: (process.env.PAYMENT_PROVIDER || 'mock').trim().toLowerCase(),
+    payment_encryption_configured: isEncryptionConfigured(),
+    dpo_configured: Boolean(process.env.DPO_COMPANY_TOKEN && process.env.DPO_SERVICE_TYPE),
     database: db
   });
 });
+
+function requireAdmin(req, res) {
+  if (!ADMIN_API_KEY) {
+    res.status(503).json({ ok: false, message: 'ADMIN_API_KEY is not configured.' });
+    return false;
+  }
+  if (req.get('x-admin-key') !== ADMIN_API_KEY) {
+    res.status(401).json({ ok: false, message: 'Unauthorized.' });
+    return false;
+  }
+  return true;
+}
 
 routes.get('/api/talentlms/config', (_req, res) => {
   res.json(buildLmsConfig());
@@ -232,9 +292,9 @@ routes.get('/api/talentlms/courses', async (_req, res) => {
     ]);
 
     const categoryMap = buildCategoryMap(categories);
+    const privateIds = await visibility.getPrivateIds();
     const visible = courses
-      .filter((c) => (c.status ?? 'active') === 'active')
-      .filter((c) => !(c.hide_from_catalog === '1' || c.hide_from_catalog === 1))
+      .filter((c) => visibility.isPublic(c, privateIds))
       .map((c) => mapCourse(c, categoryMap));
 
     res.json(visible);
@@ -261,6 +321,10 @@ routes.get('/api/talentlms/courses/:id', async (req, res) => {
         return r.data;
       })
     ]);
+    const privateIds = await visibility.getPrivateIds();
+    if (String(course?.id) !== req.params.id || !visibility.isPublic(course, privateIds)) {
+      return res.status(404).json({ error: 'course_not_found' });
+    }
     res.json(mapCourse(course, buildCategoryMap(categories)));
   } catch (err) {
     return handleLmsError(res, err);
@@ -296,6 +360,42 @@ routes.post('/api/register-interest', async (req, res) => {
   }
 
   try {
+    let enquiryId = null;
+    try {
+      const enquiry = await store.createEnquiry({
+        type: intent === 'register' ? 'interest-register' : 'interest',
+        name,
+        email,
+        phone,
+        subject: intent ? `Interest (${intent})` : 'Course interest',
+        message: [
+          selectedCourses.length ? `Courses: ${selectedCourses.join(', ')}` : null,
+          course ? `Course: ${course}` : null,
+          otherCourse ? `Other: ${otherCourse}` : null,
+          friendPhone ? `Friend phone: ${friendPhone}` : null,
+          message || null
+        ]
+          .filter(Boolean)
+          .join('\n') || 'Interest registration submitted.',
+        consent,
+        data: {
+          intent: intent || null,
+          course: course || null,
+          selectedCourses,
+          otherCourse: otherCourse || null,
+          friendPhone: friendPhone || null,
+          message: message || null
+        }
+      });
+      enquiryId = enquiry?.id || null;
+    } catch (persistErr) {
+      console.error('[register-interest] persist failed', persistErr.message);
+      return res.status(503).json({
+        ok: false,
+        message: 'Unable to save your interest right now. Please try again shortly.'
+      });
+    }
+
     const result = await sendInterestEmail({
       name,
       email,
@@ -310,6 +410,7 @@ routes.post('/api/register-interest', async (req, res) => {
     });
     return res.json({
       ok: true,
+      enquiry_id: enquiryId,
       message: result.delivered
         ? 'Your interest has been sent.'
         : 'Your interest has been recorded.'
@@ -328,8 +429,12 @@ routes.post('/api/contact', async (req, res) => {
   const name = String(body.name || '').trim();
   const email = String(body.email || '').trim();
   const phone = String(body.phone || '').trim();
+  const company = String(body.company || '').trim();
   const message = String(body.message || '').trim();
   const type = String(body.type || 'general').trim();
+  const consent = body.consent === true;
+  const subject = String(body.subject || '').trim();
+  const extra = body.data && typeof body.data === 'object' ? body.data : {};
 
   if (!name || !email || !message) {
     return res.status(400).json({ ok: false, message: 'Name, email, and message are required.' });
@@ -338,10 +443,51 @@ routes.post('/api/contact', async (req, res) => {
     return res.status(400).json({ ok: false, message: 'Invalid email address.' });
   }
 
+  const allowedTypes = new Set([
+    'general',
+    'learner',
+    'corporate',
+    'trainer',
+    'demo',
+    'interest'
+  ]);
+  const enquiryType = allowedTypes.has(type) ? type : 'general';
+
   try {
-    const result = await sendContactEmail({ name, email, phone: phone || undefined, message, type });
+    let enquiryId = null;
+    try {
+      const enquiry = await store.createEnquiry({
+        type: enquiryType,
+        name,
+        email,
+        phone: phone || undefined,
+        company: company || undefined,
+        subject: subject || undefined,
+        message,
+        consent,
+        data: extra
+      });
+      enquiryId = enquiry?.id || null;
+    } catch (persistErr) {
+      console.error('[contact] persist failed', persistErr.message);
+      return res.status(503).json({
+        ok: false,
+        message: 'Unable to save your message right now. Please try again shortly.'
+      });
+    }
+
+    const result = await sendContactEmail({
+      name,
+      email,
+      phone: phone || undefined,
+      company: company || undefined,
+      message,
+      subject: subject || undefined,
+      type: enquiryType
+    });
     return res.json({
       ok: true,
+      enquiry_id: enquiryId,
       message: result.delivered
         ? 'Your message has been sent.'
         : 'Your message has been recorded.'
@@ -355,6 +501,38 @@ routes.post('/api/contact', async (req, res) => {
   }
 });
 
+routes.get('/api/admin/enquiries', async (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  try {
+    const type = req.query.type ? String(req.query.type) : undefined;
+    const status = req.query.status ? String(req.query.status) : undefined;
+    const enquiries = await store.listEnquiries({ type, status });
+    return res.json({ ok: true, enquiries });
+  } catch (err) {
+    console.error('[admin/enquiries] list failed:', err.message);
+    return res.status(503).json({ ok: false, message: 'Unable to list enquiries.' });
+  }
+});
+
+routes.patch('/api/admin/enquiries/:id', async (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  const status = String(req.body?.status || '').trim();
+  if (!status) {
+    return res.status(400).json({ ok: false, message: 'status is required.' });
+  }
+  try {
+    const updated = await store.updateEnquiryStatus(req.params.id, status);
+    if (!updated) {
+      return res.status(404).json({ ok: false, message: 'Enquiry not found.' });
+    }
+    return res.json({ ok: true, enquiry: updated });
+  } catch (err) {
+    console.error('[admin/enquiries] update failed:', err.message);
+    return res.status(503).json({ ok: false, message: 'Unable to update enquiry.' });
+  }
+});
+
+routes.use(authRoutes);
 routes.use(checkoutRoutes);
 
 // Mount at BASE_PATH for cPanel subfolder URLs (e.g. /backend) and at / for local dev.

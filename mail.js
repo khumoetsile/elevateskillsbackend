@@ -4,6 +4,8 @@ const nodemailer = require('nodemailer');
 
 const INTEREST_EMAIL_TO = (process.env.INTEREST_EMAIL_TO || 'help@elevateskills.online').trim();
 const CONTACT_EMAIL_TO = (process.env.CONTACT_EMAIL_TO || 'help@elevateskills.online').trim();
+// Fall back to the monitored contact inbox when SALES_EMAIL_TO is unset.
+const SALES_EMAIL_TO = (process.env.SALES_EMAIL_TO || CONTACT_EMAIL_TO).trim();
 const SMTP_HOST = (process.env.SMTP_HOST || '').trim();
 const SMTP_PORT = parseInt(process.env.SMTP_PORT, 10) || 587;
 const SMTP_USER = (process.env.SMTP_USER || '').trim();
@@ -17,14 +19,16 @@ const SMTP_FROM = (
 const SMTP_SECURE = process.env.SMTP_SECURE === 'true' || SMTP_PORT === 465;
 
 function createMailTransport() {
-  if (!SMTP_HOST) {
+  // Require a real SMTP password so empty local/dev config does not
+  // attempt a send and fail after the enquiry was already saved.
+  if (!SMTP_HOST || !SMTP_USER || !SMTP_PASS) {
     return null;
   }
   return nodemailer.createTransport({
     host: SMTP_HOST,
     port: SMTP_PORT,
     secure: SMTP_SECURE,
-    auth: SMTP_USER && SMTP_PASS ? { user: SMTP_USER, pass: SMTP_PASS } : undefined
+    auth: { user: SMTP_USER, pass: SMTP_PASS }
   });
 }
 
@@ -278,12 +282,14 @@ async function deliverMail(logTag, to, replyTo, mail) {
       html: mail.html
     });
 
+    console.log(`[${logTag}] delivered to ${to}`);
     return { ok: true, delivered: true };
   } catch (err) {
-    console.error(`[${logTag}] SMTP send failed:`, err.message);
-    console.log(`[${logTag}] Would have sent to ${to} — logging submission:`);
+    console.error(`[${logTag}] SMTP send failed (to ${to}):`, err.message);
+    console.log(`[${logTag}] Would have sent — logging submission:`);
     console.log(mail.text);
-    return { ok: true, delivered: false, logged: true, error: err.message };
+    // Surface the failure so the API does not claim success when SMTP is configured.
+    throw err;
   }
 }
 
@@ -293,10 +299,50 @@ function enquiryTypeLabel(type) {
       return 'Learner support';
     case 'corporate':
       return 'Corporate training';
+    case 'demo':
+      return 'Demo request';
     case 'trainer':
       return 'Trainer / partner';
     default:
       return 'General enquiry';
+  }
+}
+
+function uniqueEmailList(...lists) {
+  const seen = new Set();
+  const out = [];
+  for (const list of lists) {
+    for (const part of String(list || '').split(',')) {
+      const email = part.trim();
+      if (!email) continue;
+      const key = email.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(email);
+    }
+  }
+  return out.join(', ');
+}
+
+function contactRecipientForType(type) {
+  // Demo / corporate / trainer go to sales, and also the contact inbox so
+  // submissions are not lost when sales@ is unmonitored or misconfigured.
+  if (type === 'demo' || type === 'corporate' || type === 'trainer') {
+    return uniqueEmailList(SALES_EMAIL_TO, CONTACT_EMAIL_TO);
+  }
+  return CONTACT_EMAIL_TO;
+}
+
+function contactIntroForType(type) {
+  switch (type) {
+    case 'demo':
+      return 'A demo request was submitted via the For Corporates page on elevateskills.online.';
+    case 'trainer':
+      return 'A trainer / partner application was submitted via the Trainers page on elevateskills.online.';
+    case 'corporate':
+      return 'A corporate training enquiry was submitted on elevateskills.online.';
+    default:
+      return 'A message was submitted via the Contact page on elevateskills.online.';
   }
 }
 
@@ -325,7 +371,7 @@ function buildContactHtml(payload, submittedAt) {
                 New contact enquiry
               </h1>
               <p style="margin:0;font-size:14px;line-height:1.6;color:#dbeafe;">
-                A message was submitted via the Contact page on elevateskills.online.
+                ${escapeHtml(contactIntroForType(payload.type))}
               </p>
             </td>
           </tr>
@@ -344,6 +390,8 @@ function buildContactHtml(payload, submittedAt) {
               <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
                 ${buildDetailRow('Full name', payload.name)}
                 ${buildDetailRow('Email address', payload.email, { link: true })}
+                ${buildDetailRow('Company', payload.company)}
+                ${payload.subject ? buildDetailRow('Subject', payload.subject) : ''}
                 ${buildDetailRow('Phone', payload.phone, { last: true })}
               </table>
             </td>
@@ -385,18 +433,20 @@ function buildContactEmail(payload) {
     'New contact enquiry - Elevate Skills',
     '',
     `Enquiry type: ${enquiryType}`,
+    payload.subject ? `Subject: ${payload.subject}` : null,
     `Name: ${payload.name}`,
     `Email: ${payload.email}`,
+    `Company: ${displayValue(payload.company)}`,
     `Phone: ${displayValue(payload.phone)}`,
     '',
     'Message:',
     payload.message,
     '',
     `Submitted: ${submittedAt.toISOString()}`
-  ];
+  ].filter((line) => line !== null);
 
   return {
-    subject: `[Elevate Skills] Contact - ${enquiryType} - ${payload.name}`,
+    subject: `[Elevate Skills] ${enquiryType} - ${payload.name}`,
     text: lines.join('\n'),
     html: buildContactHtml(payload, submittedAt)
   };
@@ -535,13 +585,79 @@ async function sendInterestEmail(payload) {
 
 async function sendContactEmail(payload) {
   const mail = buildContactEmail(payload);
-  return deliverMail('contact', CONTACT_EMAIL_TO, payload.email, mail);
+  const to = contactRecipientForType(payload.type);
+  return deliverMail('contact', to, payload.email, mail);
+}
+
+async function sendRegistrationWelcomeEmail({ firstName, email, login, password, portalUrl }) {
+  const portal = (portalUrl || process.env.PUBLIC_LMS_URL || '').trim();
+  const text = [
+    `Hi ${firstName},`,
+    '',
+    'Welcome to Elevate Skills! Your learner account has been created.',
+    '',
+    `Username: ${login}`,
+    `Temporary password: ${password}`,
+    '',
+    portal ? `Log in here: ${portal}` : 'Log in via the Elevate Skills learner portal.',
+    'Please change your password after your first login.',
+    '',
+    'Browse courses at elevateskills.online to enrol and start learning.',
+    '',
+    'Need help? Contact help@elevateskills.online.',
+    '',
+    'Elevate Skills — Empowering Skills. Elevating Potential.'
+  ].join('\n');
+
+  const html = `<!DOCTYPE html>
+<html lang="en">
+<body style="margin:0;padding:24px;background:#f1f5f9;font-family:Inter,Segoe UI,Arial,sans-serif;">
+  <div style="max-width:600px;margin:0 auto;background:#ffffff;border:1px solid #e2e8f0;border-radius:12px;overflow:hidden;">
+    <div style="background:linear-gradient(135deg,#1e3a8a 0%,#1d4ed8 100%);padding:28px 32px;">
+      <p style="margin:0 0 6px;font-size:12px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;color:#bfdbfe;">Elevate Skills</p>
+      <h1 style="margin:0;font-size:22px;color:#ffffff;">Welcome — your account is ready</h1>
+    </div>
+    <div style="padding:24px 32px;">
+      <p style="font-size:14px;color:#0f172a;">Hi ${escapeHtml(firstName)},</p>
+      <p style="font-size:14px;color:#0f172a;line-height:1.6;">
+        Your learner account has been created. Use the details below to sign in to the learning portal.
+      </p>
+      <div style="margin:16px 0;padding:14px 16px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;">
+        <p style="margin:0;font-size:14px;color:#0f172a;">Username: <strong>${escapeHtml(login)}</strong></p>
+        <p style="margin:4px 0 0;font-size:14px;color:#0f172a;">Temporary password: <strong>${escapeHtml(password)}</strong></p>
+        <p style="margin:8px 0 0;font-size:12px;color:#64748b;">Please change your password after your first login.</p>
+      </div>
+      ${
+        portal
+          ? `<p style="margin:16px 0;"><a href="${escapeHtml(portal)}" style="display:inline-block;background:#1d4ed8;color:#ffffff;text-decoration:none;padding:10px 18px;border-radius:8px;font-weight:600;font-size:14px;">Open learner portal</a></p>`
+          : ''
+      }
+      <p style="font-size:13px;color:#64748b;line-height:1.5;">
+        To enrol in a course, browse the catalogue on elevateskills.online and complete checkout with this same email address.
+      </p>
+    </div>
+  </div>
+</body>
+</html>`;
+
+  return deliverMail(
+    'registration-welcome',
+    email,
+    CONTACT_EMAIL_TO,
+    {
+      subject: '[Elevate Skills] Your learner account is ready',
+      text,
+      html
+    }
+  );
 }
 
 module.exports = {
   sendInterestEmail,
   sendContactEmail,
   sendPurchaseEmails,
+  sendRegistrationWelcomeEmail,
   INTEREST_EMAIL_TO,
-  CONTACT_EMAIL_TO
+  CONTACT_EMAIL_TO,
+  SALES_EMAIL_TO
 };

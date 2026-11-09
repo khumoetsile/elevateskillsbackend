@@ -33,7 +33,7 @@ async function findUserByEmail(email) {
   if (!normalised) return null;
 
   // TalentLMS expects the raw email in the path — encoding @ as %40 returns 404
-  // even when the user exists (verified against elevateskillsadmin.talentlms.com).
+  // even when the user exists (verified against lms.elevateskills.online).
   const attempts = [
     () => lms.get(`/users/email:${normalised}`),
     () => lms.get('/users', { params: { email: normalised } })
@@ -176,4 +176,172 @@ async function fulfilOrder(orderId, { getOrder, updateOrder }) {
   }
 }
 
-module.exports = { fulfilOrder, findUserByEmail, createUser, enrolUserToCourse };
+/**
+ * Authenticate against TalentLMS via /userlogin.
+ * Accepts TalentLMS username or email; returns profile + one-time login_key URL.
+ */
+async function loginUser({ loginOrEmail, password, logoutRedirect }) {
+  const identifier = String(loginOrEmail || '').trim();
+  const pwd = String(password || '');
+  if (!identifier || !pwd) {
+    const err = new Error('Login and password are required.');
+    err.code = 'invalid_credentials';
+    throw err;
+  }
+
+  let loginName = identifier;
+  let profileHint = null;
+  if (identifier.includes('@')) {
+    profileHint = await findUserByEmail(identifier);
+    if (!profileHint?.login) {
+      const err = new Error('Invalid email or password.');
+      err.code = 'invalid_credentials';
+      throw err;
+    }
+    loginName = profileHint.login;
+  }
+
+  const form = new URLSearchParams({
+    login: loginName,
+    password: pwd
+  });
+  if (logoutRedirect) {
+    form.set('logout_redirect', String(logoutRedirect));
+  }
+
+  try {
+    const r = await lms.post('/userlogin', form);
+    const data = r.data || {};
+    const loginKey = data.login_key || null;
+    const userId = data.user_id != null ? String(data.user_id) : null;
+
+    let profile = profileHint;
+    if (!profile && userId) {
+      try {
+        const u = await lms.get(`/users/id:${encodeURIComponent(userId)}`);
+        profile = u.data;
+      } catch {
+        profile = null;
+      }
+    }
+    if (!profile) {
+      try {
+        const u = await lms.get(`/users/username:${encodeURIComponent(loginName)}`);
+        profile = u.data;
+      } catch {
+        profile = {
+          id: userId,
+          login: loginName,
+          email: identifier.includes('@') ? identifier.toLowerCase() : '',
+          first_name: '',
+          last_name: ''
+        };
+      }
+    }
+
+    return {
+      user: {
+        id: String(profile.id || userId || ''),
+        login: profile.login || loginName,
+        email: String(profile.email || (identifier.includes('@') ? identifier : '')).toLowerCase(),
+        first_name: profile.first_name || '',
+        last_name: profile.last_name || ''
+      },
+      login_key: loginKey
+    };
+  } catch (err) {
+    if (err.code === 'invalid_credentials') throw err;
+    const message = lmsErrorMessage(err);
+    if (
+      /invalid|password|credentials|not found|incorrect|wrong/i.test(String(message)) ||
+      err?.response?.status === 401 ||
+      err?.response?.status === 403
+    ) {
+      const e = new Error('Invalid email/username or password.');
+      e.code = 'invalid_credentials';
+      throw e;
+    }
+    throw new Error(`login failed: ${message}`);
+  }
+}
+
+/**
+ * Fresh one-time TalentLMS autologin URL for a known user id (API returns login_key).
+ */
+async function getAutologinUrl(userId) {
+  const id = String(userId || '').trim();
+  if (!id) throw new Error('user id is required');
+  try {
+    const r = await lms.get(`/users/id:${encodeURIComponent(id)}`);
+    const key = r.data?.login_key;
+    if (!key) throw new Error('TalentLMS did not return a login key for this user.');
+    return String(key);
+  } catch (err) {
+    throw new Error(`autologin failed: ${lmsErrorMessage(err)}`);
+  }
+}
+
+/**
+ * Returns enrolment status for a TalentLMS user against a course id.
+ */
+async function getUserCourseEnrolment(userId, courseId) {
+  const uid = String(userId || '').trim();
+  const cid = String(courseId || '').trim();
+  if (!uid || !cid) {
+    return { enrolled: false, course: null };
+  }
+
+  const r = await lms.get(`/users/id:${encodeURIComponent(uid)}`);
+  const courses = Array.isArray(r.data?.courses) ? r.data.courses : [];
+  const match = courses.find((c) => String(c.id) === cid);
+  if (!match) {
+    return { enrolled: false, course: null };
+  }
+
+  return {
+    enrolled: true,
+    course: {
+      id: String(match.id),
+      name: match.name || '',
+      role: match.role || 'learner',
+      completion_status: match.completion_status || null,
+      completion_percentage:
+        match.completion_percentage != null ? String(match.completion_percentage) : null,
+      enrolled_on: match.enrolled_on || null
+    }
+  };
+}
+
+/**
+ * One-time TalentLMS URL that signs the user in and opens a specific course.
+ */
+async function getCourseGotoUrl(userId, courseId, logoutRedirect) {
+  const uid = String(userId || '').trim();
+  const cid = String(courseId || '').trim();
+  if (!uid || !cid) throw new Error('user id and course id are required');
+
+  const parts = [`user_id:${uid}`, `course_id:${cid}`];
+  if (logoutRedirect) {
+    parts.push(`logout_redirect:${Buffer.from(String(logoutRedirect)).toString('base64')}`);
+  }
+
+  try {
+    const r = await lms.get(`/gotocourse/${parts.join(',')}`);
+    const url = r.data?.goto_url;
+    if (!url) throw new Error('TalentLMS did not return a course goto URL.');
+    return String(url);
+  } catch (err) {
+    throw new Error(`goto course failed: ${lmsErrorMessage(err)}`);
+  }
+}
+
+module.exports = {
+  fulfilOrder,
+  findUserByEmail,
+  createUser,
+  enrolUserToCourse,
+  loginUser,
+  getAutologinUrl,
+  getUserCourseEnrolment,
+  getCourseGotoUrl
+};
